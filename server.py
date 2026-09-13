@@ -4,7 +4,7 @@ from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'kahoot_ultra_secret_key'
+app.config['SECRET_KEY'] = '363636M1nhqaauzn'
 
 socketio = SocketIO(
     app, 
@@ -148,4 +148,4 @@ def send_player_update(pin):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, host='0.0.0.0', port=port)
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
