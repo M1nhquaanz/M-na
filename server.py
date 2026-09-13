@@ -1,16 +1,27 @@
-import random
-from flask import Flask, render_template, request
-from flask_socketio import SocketIO, emit, join_room, leave_room
 import os
+import random
+from flask import Flask, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'kahoot_ultra_secret_key'
-socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=10 * 1024 * 1024) # Hỗ trợ upload ảnh 10MB
+
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    max_http_buffer_size=10 * 1024 * 1024,
+    async_mode='threading'
+)
 
 ROOMS = {}
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+# Route kiểm tra Server live trên Render
+@app.route('/healthcheck')
+@app.route('/ping')
+def healthcheck():
+    return {'status': 'online', 'active_rooms': len(ROOMS)}, 200
+
+# --- SOCKET EVENTS ---
 
 @socketio.on('create_room')
 def handle_create_room(data):
@@ -116,11 +127,25 @@ def handle_trigger_admin(data):
     if pin in ROOMS and ROOMS[pin]['host_sid'] == request.sid:
         socketio.emit('show_dev_sig', to=pin)
 
+@socketio.on('disconnect')
+def handle_disconnect():
+    for pin, room in list(ROOMS.items()):
+        if room['host_sid'] == request.sid:
+            socketio.emit('host_left', {'message': 'Host đã rời phòng!'}, to=pin)
+            del ROOMS[pin]
+            break
+        elif request.sid in room['players']:
+            del room['players'][request.sid]
+            send_player_update(pin)
+            break
+
+# --- HELPER FUNCTIONS ---
+
 def send_player_update(pin):
-    players_data = [{'id': sid, 'name': p['name'], 'score': p['score']} for sid, p in ROOMS[pin]['players'].items()]
-    socketio.emit('update_player_list', {'players': players_data}, to=pin)
+    if pin in ROOMS:
+        players_data = [{'id': sid, 'name': p['name'], 'score': p['score']} for sid, p in ROOMS[pin]['players'].items()]
+        socketio.emit('update_player_list', {'players': players_data}, to=pin)
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
     port = int(os.environ.get('PORT', 5000))
     socketio.run(app, host='0.0.0.0', port=port)
