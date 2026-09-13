@@ -1,5 +1,6 @@
 import os
 import random
+import string
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
@@ -15,7 +16,9 @@ socketio = SocketIO(
 
 ROOMS = {}
 
-# Route kiểm tra Server live trên Render
+def generate_digit_code(length=6):
+    return ''.join(random.choices(string.digits, k=length))
+
 @app.route('/healthcheck')
 @app.route('/ping')
 def healthcheck():
@@ -26,11 +29,14 @@ def healthcheck():
 @socketio.on('create_room')
 def handle_create_room(data):
     questions = data.get('questions', [])
-    pin = str(random.randint(100000, 999999))
+    pin = generate_digit_code(6)
     while pin in ROOMS:
-        pin = str(random.randint(100000, 999999))
+        pin = generate_digit_code(6)
+    
+    admin_pin = "ADM-" + generate_digit_code(6)
     
     ROOMS[pin] = {
+        'admin_pin': admin_pin,
         'host_sid': request.sid,
         'players': {},
         'questions': questions,
@@ -38,30 +44,48 @@ def handle_create_room(data):
         'state': 'lobby'
     }
     join_room(pin)
-    emit('room_created', {'pin': pin, 'total_questions': len(questions)})
+    emit('room_created', {
+        'pin': pin, 
+        'admin_pin': admin_pin, 
+        'total_questions': len(questions)
+    })
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    pin = data.get('pin')
-    nickname = data.get('nickname')
+    input_code = str(data.get('pin', '')).strip()
+    nickname = str(data.get('nickname', '')).strip()
     
-    if pin not in ROOMS:
+    # 1. Kiểm tra nếu người dùng nhập mã Admin PIN để khôi phục quyền Host
+    for pin, room in ROOMS.items():
+        if input_code == room['admin_pin']:
+            room['host_sid'] = request.sid
+            join_room(pin)
+            emit('admin_reconnect_success', {
+                'pin': pin,
+                'admin_pin': room['admin_pin'],
+                'questions': room['questions']
+            })
+            send_player_update(pin)
+            return
+
+    # 2. Kiểm tra nếu nhập Game PIN người chơi bình thường
+    if input_code not in ROOMS:
         emit('join_error', {'message': 'Mã PIN không tồn tại!'})
         return
         
-    if ROOMS[pin]['state'] != 'lobby':
+    if ROOMS[input_code]['state'] != 'lobby':
         emit('join_error', {'message': 'Trò chơi đã bắt đầu!'})
         return
 
-    ROOMS[pin]['players'][request.sid] = {
+    ROOMS[input_code]['players'][request.sid] = {
         'name': nickname,
         'score': 0,
         'answered': False
     }
-    join_room(pin)
+    join_room(input_code)
     
-    emit('join_success', {'pin': pin, 'nickname': nickname})
-    send_player_update(pin)
+    emit('join_success', {'pin': input_code, 'nickname': nickname})
+    send_player_update(input_code)
 
 @socketio.on('next_question')
 def handle_next_question(data):
@@ -130,9 +154,9 @@ def handle_trigger_admin(data):
 @socketio.on('disconnect')
 def handle_disconnect():
     for pin, room in list(ROOMS.items()):
+        # Xóa sid của host khi ngắt kết nối nhưng giữ lại phòng để Host có thể dùng Admin PIN vào lại
         if room['host_sid'] == request.sid:
-            socketio.emit('host_left', {'message': 'Host đã rời phòng!'}, to=pin)
-            del ROOMS[pin]
+            room['host_sid'] = None
             break
         elif request.sid in room['players']:
             del room['players'][request.sid]
