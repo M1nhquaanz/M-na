@@ -71,6 +71,9 @@ def handle_create_room(data):
     for q in raw_questions:
         if q.get('image'):
             q['image'] = fast_optimize_image(q['image'])
+        
+        # Đảm bảo trường video được lưu trữ (mặc định chuỗi rỗng nếu không có)
+        q['video'] = q.get('video', '')
         questions.append(q)
 
     pin = generate_digit_code(6)
@@ -196,6 +199,7 @@ def handle_next_question(data):
             'title': q['title'],
             'type': q['type'],
             'image': q.get('image', ''),
+            'video': q.get('video', ''),  # Gửi thêm thuộc tính video về client
             'options': q.get('options', [])
         }
         
