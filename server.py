@@ -3,19 +3,19 @@ import random
 import string
 import base64
 from io import BytesIO
-from PIL import Image, ImageSequence
+from PIL import Image
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = '363636M1nhqaauzn'
 
-# 1. Cấu hình SocketIO tối ưu Performance
+# Socket.IO config
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
-    max_http_buffer_size=100 * 1024 * 1024, # Nâng buffer size lên 100MB cho dữ liệu GIF
-    async_mode='gevent', # Khuyên dùng gevent hoặc eventlet thay cho threading để tránh lag Socket
+    max_http_buffer_size=50 * 1024 * 1024, # 50MB Buffer
+    async_mode='gevent',
     ping_timeout=60,
     ping_interval=25
 )
@@ -25,50 +25,31 @@ ROOMS = {}
 def generate_digit_code(length=6):
     return ''.join(random.choices(string.digits, k=length))
 
-def optimize_gif_base64(b64_string, max_size=(600, 600), quality=70):
+def fast_optimize_image(b64_string, max_size=(800, 800)):
     """
-    Hàm helper tự động resize & nén GIF Base64 trực tiếp trên Server 
-    để giảm dung lượng từ 80-90% trước khi gửi xuống Client.
+    Xử lý nhanh Base64. Nếu là GIF động thì giữ nguyên (đã nén phía client),
+    nếu là ảnh tĩnh PNG/JPG thì resize nhẹ để tối ưu bandwidth.
     """
     if not b64_string or not b64_string.startswith('data:image'):
         return b64_string
     
+    # Nếu là GIF, bỏ qua việc re-encode từng frame trên server để tránh làm treo Event Loop
+    if 'data:image/gif' in b64_string:
+        return b64_string
+
     try:
         header, encoded = b64_string.split(',', 1)
         image_data = base64.b64decode(encoded)
         img = Image.open(BytesIO(image_data))
-
-        # Nếu là GIF động
-        if getattr(img, "is_animated", False):
-            frames = []
-            for frame in ImageSequence.Iterator(img):
-                f = frame.copy()
-                f.thumbnail(max_size, Image.Resampling.LANCZOS)
-                frames.append(f)
-            
-            output = BytesIO()
-            frames[0].save(
-                output,
-                format='GIF',
-                save_all=True,
-                append_images=frames[1:],
-                optimize=True,
-                loop=0
-            )
-            compressed_b64 = base64.b64encode(output.getvalue()).decode('utf-8')
-            return f"{header},{compressed_b64}"
-        else:
-            # Nếu là ảnh tĩnh (PNG/JPG)
-            img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            output = BytesIO()
-            img.save(output, format='WEBP', quality=quality, optimize=True)
-            compressed_b64 = base64.b64encode(output.getvalue()).decode('utf-8')
-            return f"data:image/webp;base64,{compressed_b64}"
-            
+        
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        output = BytesIO()
+        img.save(output, format='WEBP', quality=80, optimize=True)
+        compressed_b64 = base64.b64encode(output.getvalue()).decode('utf-8')
+        return f"data:image/webp;base64,{compressed_b64}"
     except Exception as e:
-        print(f"⚠️ Warning: Compression failed, using original media. Error: {e}")
+        print(f"⚠️ Image optimize skipped: {e}")
         return b64_string
-
 
 @app.route('/healthcheck')
 @app.route('/ping')
@@ -86,11 +67,10 @@ def handle_create_room(data):
     """Admin tạo phòng game mới"""
     raw_questions = data.get('questions', [])
     
-    # Nén toàn bộ ảnh/GIF ngay khi tạo phòng để tránh nghẽn khi đang chơi
     questions = []
     for q in raw_questions:
         if q.get('image'):
-            q['image'] = optimize_gif_base64(q['image'])
+            q['image'] = fast_optimize_image(q['image'])
         questions.append(q)
 
     pin = generate_digit_code(6)
@@ -121,7 +101,6 @@ def handle_create_room(data):
 
 @socketio.on('admin_login')
 def handle_admin_login(data):
-    """Admin đăng nhập lại vào phòng game đã tạo trước đó"""
     input_pin = str(data.get('pin', '')).strip()
     input_admin_pin = str(data.get('admin_pin', '')).strip()
     
@@ -147,11 +126,9 @@ def handle_admin_login(data):
     })
     
     send_player_update(input_pin)
-    print(f'✅ Admin login success: PIN={input_pin}')
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    """Player tham gia phòng game"""
     input_code = str(data.get('pin', '')).strip()
     nickname = str(data.get('nickname', '')).strip()
     
@@ -179,19 +156,15 @@ def handle_join_room(data):
     })
     
     send_player_update(input_code)
-    print(f'✅ Player joined: {nickname} in room {input_code}')
 
 @socketio.on('next_question')
 def handle_next_question(data):
-    """Admin bấm chuyển câu hỏi"""
     pin = data.get('pin')
-    
     if pin not in ROOMS:
         emit('error', {'message': 'Phòng không tồn tại'})
         return
     
     room = ROOMS[pin]
-    
     if room['host_sid'] != request.sid:
         emit('error', {'message': 'Bạn không phải là host!'})
         return
@@ -211,10 +184,8 @@ def handle_next_question(data):
             for p in leaderboard
         ]
         socketio.emit('game_over', {'leaderboard': leaderboard_data}, to=pin)
-        print(f'🏆 Game ended in room {pin}')
     else:
         room['state'] = 'playing'
-        
         for player in room['players'].values():
             player['answered'] = False
         
@@ -224,12 +195,11 @@ def handle_next_question(data):
             'total': len(room['questions']),
             'title': q['title'],
             'type': q['type'],
-            'image': q.get('image', ''), # Chỉ gửi câu hỏi hiện tại kèm ảnh/GIF đã nén
+            'image': q.get('image', ''),
             'options': q.get('options', [])
         }
         
         socketio.emit('new_question', q_data, to=pin)
-        print(f'📝 Question {q_data["index"]}/{q_data["total"]} sent to room {pin}')
 
 @socketio.on('submit_answer')
 def handle_submit_answer(data):
@@ -279,15 +249,13 @@ def handle_kick_player(data):
     pin = data.get('pin')
     player_id = data.get('player_id')
     
-    if pin not in ROOMS or ROOMS[pin]['host_sid'] != request.sid:
-        return
-    
-    room = ROOMS[pin]
-    if player_id in room['players']:
-        del room['players'][player_id]
-        room['answered_players'].discard(player_id)
-        socketio.emit('kicked', to=player_id)
-        send_player_update(pin)
+    if pin in ROOMS and ROOMS[pin]['host_sid'] == request.sid:
+        room = ROOMS[pin]
+        if player_id in room['players']:
+            del room['players'][player_id]
+            room['answered_players'].discard(player_id)
+            socketio.emit('kicked', to=player_id)
+            send_player_update(pin)
 
 @socketio.on('trigger_admin_dev')
 def handle_trigger_admin(data):
@@ -308,7 +276,6 @@ def handle_adjust_score(data):
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print(f'❌ Client disconnected: {request.sid}')
     for pin, room in list(ROOMS.items()):
         if room['host_sid'] == request.sid:
             room['host_sid'] = None
@@ -334,5 +301,4 @@ def send_player_update(pin):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f'🚀 Starting server on port {port}...')
     socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
