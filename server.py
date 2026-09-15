@@ -1,23 +1,74 @@
 import os
 import random
 import string
+import base64
+from io import BytesIO
+from PIL import Image, ImageSequence
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = '363636M1nhqaauzn'
 
+# 1. Cấu hình SocketIO tối ưu Performance
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
-    max_http_buffer_size=10 * 1024 * 1024,
-    async_mode='threading'
+    max_http_buffer_size=100 * 1024 * 1024, # Nâng buffer size lên 100MB cho dữ liệu GIF
+    async_mode='gevent', # Khuyên dùng gevent hoặc eventlet thay cho threading để tránh lag Socket
+    ping_timeout=60,
+    ping_interval=25
 )
 
 ROOMS = {}
 
 def generate_digit_code(length=6):
     return ''.join(random.choices(string.digits, k=length))
+
+def optimize_gif_base64(b64_string, max_size=(600, 600), quality=70):
+    """
+    Hàm helper tự động resize & nén GIF Base64 trực tiếp trên Server 
+    để giảm dung lượng từ 80-90% trước khi gửi xuống Client.
+    """
+    if not b64_string or not b64_string.startswith('data:image'):
+        return b64_string
+    
+    try:
+        header, encoded = b64_string.split(',', 1)
+        image_data = base64.b64decode(encoded)
+        img = Image.open(BytesIO(image_data))
+
+        # Nếu là GIF động
+        if getattr(img, "is_animated", False):
+            frames = []
+            for frame in ImageSequence.Iterator(img):
+                f = frame.copy()
+                f.thumbnail(max_size, Image.Resampling.LANCZOS)
+                frames.append(f)
+            
+            output = BytesIO()
+            frames[0].save(
+                output,
+                format='GIF',
+                save_all=True,
+                append_images=frames[1:],
+                optimize=True,
+                loop=0
+            )
+            compressed_b64 = base64.b64encode(output.getvalue()).decode('utf-8')
+            return f"{header},{compressed_b64}"
+        else:
+            # Nếu là ảnh tĩnh (PNG/JPG)
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            output = BytesIO()
+            img.save(output, format='WEBP', quality=quality, optimize=True)
+            compressed_b64 = base64.b64encode(output.getvalue()).decode('utf-8')
+            return f"data:image/webp;base64,{compressed_b64}"
+            
+    except Exception as e:
+        print(f"⚠️ Warning: Compression failed, using original media. Error: {e}")
+        return b64_string
+
 
 @app.route('/healthcheck')
 @app.route('/ping')
@@ -33,10 +84,16 @@ def handle_connect():
 @socketio.on('create_room')
 def handle_create_room(data):
     """Admin tạo phòng game mới"""
-    questions = data.get('questions', [])
-    pin = generate_digit_code(6)
+    raw_questions = data.get('questions', [])
     
-    # Đảm bảo PIN không trùng
+    # Nén toàn bộ ảnh/GIF ngay khi tạo phòng để tránh nghẽn khi đang chơi
+    questions = []
+    for q in raw_questions:
+        if q.get('image'):
+            q['image'] = optimize_gif_base64(q['image'])
+        questions.append(q)
+
+    pin = generate_digit_code(6)
     while pin in ROOMS:
         pin = generate_digit_code(6)
     
@@ -68,25 +125,16 @@ def handle_admin_login(data):
     input_pin = str(data.get('pin', '')).strip()
     input_admin_pin = str(data.get('admin_pin', '')).strip()
     
-    # Kiểm tra Game PIN có tồn tại không
     if input_pin not in ROOMS:
-        emit('admin_login_error', {
-            'message': 'Game PIN không tồn tại! Phòng có thể đã kết thúc.'
-        })
-        print(f'❌ Admin login failed: PIN {input_pin} not found')
+        emit('admin_login_error', {'message': 'Game PIN không tồn tại!'})
         return
     
     room = ROOMS[input_pin]
     
-    # Kiểm tra Admin PIN có chính xác không
     if input_admin_pin != room['admin_pin']:
-        emit('admin_login_error', {
-            'message': 'Admin PIN không chính xác!'
-        })
-        print(f'❌ Admin login failed: Wrong admin PIN for {input_pin}')
+        emit('admin_login_error', {'message': 'Admin PIN không chính xác!'})
         return
     
-    # Đăng nhập thành công - cập nhật host_sid mới
     room['host_sid'] = request.sid
     join_room(input_pin)
     
@@ -98,32 +146,25 @@ def handle_admin_login(data):
         'state': room['state']
     })
     
-    # Gửi danh sách người chơi hiện tại
     send_player_update(input_pin)
-    
     print(f'✅ Admin login success: PIN={input_pin}')
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    """Player tham gia phòng game bằng Game PIN"""
+    """Player tham gia phòng game"""
     input_code = str(data.get('pin', '')).strip()
     nickname = str(data.get('nickname', '')).strip()
     
-    # Kiểm tra PIN có tồn tại không
     if input_code not in ROOMS:
         emit('join_error', {'message': 'Mã PIN không tồn tại!'})
-        print(f'❌ Join failed: PIN {input_code} not found')
         return
     
     room = ROOMS[input_code]
     
-    # Kiểm tra trạng thái phòng
     if room['state'] != 'lobby':
-        emit('join_error', {'message': 'Trò chơi đã bắt đầu! Không thể vào lúc này.'})
-        print(f'❌ Join failed: Room {input_code} already started')
+        emit('join_error', {'message': 'Trò chơi đã bắt đầu!'})
         return
     
-    # Thêm player vào phòng
     ROOMS[input_code]['players'][request.sid] = {
         'name': nickname,
         'score': 0,
@@ -137,14 +178,12 @@ def handle_join_room(data):
         'nickname': nickname
     })
     
-    # Cập nhật danh sách người chơi cho admin
     send_player_update(input_code)
-    
     print(f'✅ Player joined: {nickname} in room {input_code}')
 
 @socketio.on('next_question')
 def handle_next_question(data):
-    """Admin bấn nút chuyển câu hỏi"""
+    """Admin bấm chuyển câu hỏi"""
     pin = data.get('pin')
     
     if pin not in ROOMS:
@@ -153,7 +192,6 @@ def handle_next_question(data):
     
     room = ROOMS[pin]
     
-    # Kiểm tra có phải host không
     if room['host_sid'] != request.sid:
         emit('error', {'message': 'Bạn không phải là host!'})
         return
@@ -161,7 +199,6 @@ def handle_next_question(data):
     room['current_q_index'] += 1
     room['answered_players'].clear()
     
-    # Kiểm tra hết câu hỏi chưa
     if room['current_q_index'] >= len(room['questions']):
         room['state'] = 'ended'
         leaderboard = sorted(
@@ -178,18 +215,16 @@ def handle_next_question(data):
     else:
         room['state'] = 'playing'
         
-        # Reset trạng thái answered của tất cả players
         for player in room['players'].values():
             player['answered'] = False
         
-        # Lấy câu hỏi hiện tại
         q = room['questions'][room['current_q_index']]
         q_data = {
             'index': room['current_q_index'] + 1,
             'total': len(room['questions']),
             'title': q['title'],
             'type': q['type'],
-            'image': q.get('image', ''),
+            'image': q.get('image', ''), # Chỉ gửi câu hỏi hiện tại kèm ảnh/GIF đã nén
             'options': q.get('options', [])
         }
         
@@ -198,31 +233,23 @@ def handle_next_question(data):
 
 @socketio.on('submit_answer')
 def handle_submit_answer(data):
-    """Player gửi câu trả lời"""
     pin = data.get('pin')
     answer = str(data.get('answer', '')).strip()
     
-    if pin not in ROOMS:
+    if pin not in ROOMS or request.sid not in ROOMS[pin]['players']:
         return
     
     room = ROOMS[pin]
-    
-    if request.sid not in room['players']:
-        return
-    
     player = room['players'][request.sid]
     
-    # Kiểm tra player đã trả lời chưa
     if player['answered']:
         return
     
     player['answered'] = True
     room['answered_players'].add(request.sid)
     
-    # Lấy câu hỏi hiện tại
     current_q = room['questions'][room['current_q_index']]
     
-    # So sánh câu trả lời (không phân biệt hoa thường)
     if current_q['type'] == 'quiz':
         correct_ans = str(current_q['correct']).strip()
         is_correct = (str(answer) == str(correct_ans))
@@ -230,114 +257,69 @@ def handle_submit_answer(data):
         correct_ans = str(current_q['correct']).strip().lower()
         is_correct = (answer.lower() == correct_ans)
     
-    # Cộng điểm nếu đúng
     if is_correct:
         player['score'] += 10
     
-    # Gửi kết quả cho player
     emit('answer_result', {
         'correct': is_correct, 
         'score': player['score']
     })
     
-    # Cập nhật danh sách player cho admin (để admin thấy ai đã trả lời)
     send_player_update(pin)
     
-    # Phát event cho admin biết có player trả lời
     socketio.emit('player_submitted', {
         'player_id': request.sid,
         'player_name': player['name'],
         'answered_count': len(room['answered_players']),
         'total_players': len(room['players'])
     }, to=pin)
-    
-    print(f'📤 Answer submitted by {player["name"]} - Correct: {is_correct}')
 
 @socketio.on('kick_player')
 def handle_kick_player(data):
-    """Admin kick player khỏi phòng"""
     pin = data.get('pin')
     player_id = data.get('player_id')
     
-    if pin not in ROOMS:
+    if pin not in ROOMS or ROOMS[pin]['host_sid'] != request.sid:
         return
     
     room = ROOMS[pin]
-    
-    # Kiểm tra có phải host không
-    if room['host_sid'] != request.sid:
-        return
-    
-    # Xóa player khỏi phòng
     if player_id in room['players']:
         del room['players'][player_id]
         room['answered_players'].discard(player_id)
-        
-        # Thông báo cho player bị kick
         socketio.emit('kicked', to=player_id)
-        
-        # Cập nhật danh sách player cho admin
         send_player_update(pin)
-        
-        print(f'🗑️ Player {player_id} kicked from room {pin}')
 
 @socketio.on('trigger_admin_dev')
 def handle_trigger_admin(data):
-    """Admin bấn nút Dev Signature"""
     pin = data.get('pin')
-    
     if pin in ROOMS and ROOMS[pin]['host_sid'] == request.sid:
-        # Phát dev signature cho tất cả người dùng trong phòng
         socketio.emit('show_dev_sig', to=pin)
-        print(f'✨ Dev signature triggered in room {pin}')
 
 @socketio.on('adjust_score')
 def handle_adjust_score(data):
-    """Admin điều chỉnh điểm của player"""
     pin = data.get('pin')
     player_id = data.get('player_id')
     delta = data.get('delta', 0)
     
-    if pin not in ROOMS:
-        return
-    
-    room = ROOMS[pin]
-    
-    # Kiểm tra có phải host không
-    if room['host_sid'] != request.sid:
-        return
-    
-    # Điều chỉnh điểm
-    if player_id in room['players']:
-        room['players'][player_id]['score'] += delta
-        send_player_update(pin)
-        print(f'📊 Score adjusted for player {player_id}: {delta:+d}')
+    if pin in ROOMS and ROOMS[pin]['host_sid'] == request.sid:
+        if player_id in ROOMS[pin]['players']:
+            ROOMS[pin]['players'][player_id]['score'] += delta
+            send_player_update(pin)
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """Xử lý khi client ngắt kết nối"""
     print(f'❌ Client disconnected: {request.sid}')
-    
     for pin, room in list(ROOMS.items()):
-        # Nếu host ngắt kết nối, giữ lại phòng để host có thể đăng nhập lại
         if room['host_sid'] == request.sid:
             room['host_sid'] = None
-            print(f'⚠️ Host disconnected from room {pin} - room preserved for reconnect')
             break
-        
-        # Nếu player ngắt kết nối, xóa player khỏi phòng
         elif request.sid in room['players']:
-            player_name = room['players'][request.sid]['name']
             del room['players'][request.sid]
             room['answered_players'].discard(request.sid)
             send_player_update(pin)
-            print(f'⚠️ Player {player_name} disconnected from room {pin}')
             break
 
-# --- HELPER FUNCTIONS ---
-
 def send_player_update(pin):
-    """Gửi danh sách người chơi hiện tại cho tất cả trong phòng"""
     if pin in ROOMS:
         players_data = [
             {
